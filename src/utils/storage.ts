@@ -1,7 +1,9 @@
 import type { SaleRecord, SyncStatus } from '../types'
+import { supabase } from '../integrations/supabase/client'
 import { STORAGE_KEYS, generateId, SAMPLE_SALES } from '../constants'
+import { toast } from 'sonner'
 
-// ── Local Storage Engine ──────────────────────────────────────
+// ── Local Storage Engine ─────────────────────────────────────────────
 
 function loadJSON<T>(key: string, fallback: T): T {
   try {
@@ -16,7 +18,7 @@ function saveJSON(key: string, data: unknown) {
   localStorage.setItem(key, JSON.stringify(data))
 }
 
-// ── Sales CRUD ────────────────────────────────────────────────
+// ── Sales CRUD ───────────────────────────────────────────────────────
 
 export function getSales(): SaleRecord[] {
   return loadJSON<SaleRecord[]>(STORAGE_KEYS.SALES, [])
@@ -49,7 +51,7 @@ export function deleteSale(id: string) {
   saveJSON(STORAGE_KEYS.SALES, sales)
 }
 
-// ── Sync Queue Engine ─────────────────────────────────────────
+// ── Sync Queue Engine ────────────────────────────────────────────────
 
 type SyncQueueItem = { saleId: string; retries: number }
 
@@ -74,13 +76,23 @@ export function dequeueSync(saleId: string) {
   saveSyncQueue(queue)
 }
 
-// ── Mock Remote Sync ──────────────────────────────────────────
+// ── Supabase Sync Engine ─────────────────────────────────────────────
 
-async function mockSyncRemote(sale: SaleRecord): Promise<boolean> {
-  // Simulate network latency (200-600ms)
-  await new Promise((r) => setTimeout(r, 200 + Math.random() * 400))
-  // 95% success rate
-  if (Math.random() < 0.05) throw new Error('Network timeout')
+async function pushSaleToSupabase(sale: SaleRecord): Promise<boolean> {
+  const { error } = await supabase.from('sales').upsert(
+    {
+      id: sale.id,
+      amount: sale.amount,
+      item_label: sale.itemLabel,
+      payment_method: sale.paymentMethod,
+      transfer_confirmed: sale.transferConfirmed,
+      sync_status: 'synced',
+      created_at: sale.createdAt,
+      synced_at: new Date().toISOString(),
+    },
+    { onConflict: 'id' }
+  )
+  if (error) throw error
   return true
 }
 
@@ -96,23 +108,22 @@ export async function processSyncQueue(onProgress?: (id: string, status: SyncSta
       continue
     }
 
-    // Mark as syncing
     updateSaleStatus(item.saleId, 'syncing')
     onProgress?.(item.saleId, 'syncing')
 
     try {
-      await mockSyncRemote(sale)
+      await pushSaleToSupabase(sale)
       const now = new Date().toISOString()
       updateSaleStatus(item.saleId, 'synced', now)
       dequeueSync(item.saleId)
       onProgress?.(item.saleId, 'synced')
-    } catch {
+    } catch (err) {
       item.retries++
       if (item.retries >= 5) {
         updateSaleStatus(item.saleId, 'failed')
         onProgress?.(item.saleId, 'failed')
+        toast.error(`Sync failed for ${sale.itemLabel || 'sale'} — will retry later`)
       } else {
-        // Leave in queue for retry
         saveSyncQueue(queue)
         onProgress?.(item.saleId, 'pending')
       }
@@ -120,7 +131,46 @@ export async function processSyncQueue(onProgress?: (id: string, status: SyncSta
   }
 }
 
-// ── Network Status ────────────────────────────────────────────
+// ── Fetch sales from Supabase and merge with local ───────────────────
+
+export async function fetchRemoteSales(): Promise<SaleRecord[]> {
+  const { data, error } = await supabase
+    .from('sales')
+    .select('*')
+    .order('created_at', { ascending: false })
+
+  if (error) {
+    toast.error(error.message || 'Failed to fetch sales from cloud')
+    return []
+  }
+
+  return (data || []).map((row) => ({
+    id: row.id,
+    amount: row.amount,
+    paymentMethod: row.payment_method as SaleRecord['paymentMethod'],
+    itemLabel: row.item_label || '',
+    syncStatus: 'synced' as SyncStatus,
+    transferConfirmed: row.transfer_confirmed,
+    createdAt: row.created_at,
+    syncedAt: row.synced_at,
+  }))
+}
+
+export async function mergeRemoteSales() {
+  const remoteSales = await fetchRemoteSales()
+  if (remoteSales.length === 0) return
+
+  const localSales = getSales()
+  const localIds = new Set(localSales.map((s) => s.id))
+
+  // Add remote sales that aren't in local storage
+  const newSales = remoteSales.filter((s) => !localIds.has(s.id))
+  if (newSales.length > 0) {
+    saveJSON(STORAGE_KEYS.SALES, [...newSales, ...localSales])
+  }
+}
+
+// ── Network Status ───────────────────────────────────────────────────
 
 type NetworkListener = (online: boolean) => void
 const listeners = new Set<NetworkListener>()
@@ -134,7 +184,7 @@ export function notifyNetworkListeners(online: boolean) {
   listeners.forEach((fn) => fn(online))
 }
 
-// ── Online / Offline Detection ────────────────────────────────
+// ── Online / Offline Detection ───────────────────────────────────────
 
 let _manualOffline = false
 
@@ -147,7 +197,7 @@ export function isOnline(): boolean {
   return navigator.onLine
 }
 
-// ── Daily Summary ─────────────────────────────────────────────
+// ── Daily Summary ────────────────────────────────────────────────────
 
 export function computeDailySummary(): import('../types').DailySummary {
   const sales = getSales()
@@ -171,7 +221,7 @@ export function computeDailySummary(): import('../types').DailySummary {
   }
 }
 
-// ── Settings ──────────────────────────────────────────────────
+// ── Settings ─────────────────────────────────────────────────────────
 
 export function getSettings(): import('../types').VendorSettings {
   return loadJSON<import('../types').VendorSettings>(STORAGE_KEYS.SETTINGS, {
@@ -185,7 +235,7 @@ export function saveSettings(settings: import('../types').VendorSettings) {
   saveJSON(STORAGE_KEYS.SETTINGS, settings)
 }
 
-// ── Seed sample data (first run) ──────────────────────────────
+// ── Seed sample data (first run) ─────────────────────────────────────
 
 export function ensureSampleData() {
   const existing = getSales()

@@ -1,9 +1,11 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Wifi, WifiOff, Smartphone, CircleCheck, LoaderCircle } from 'lucide-react'
+import { Smartphone, LoaderCircle, Download } from 'lucide-react'
 import Navigation, { type NavTab } from './components/Navigation'
 import NewSaleModal from './components/NewSaleModal'
 import HistoryAndSummary from './components/HistoryAndSummary'
+import DashboardView from './components/DashboardView'
+import SettingsView from './components/SettingsView'
 import {
   getSales,
   isOnline,
@@ -14,6 +16,7 @@ import {
   saveSettings,
   ensureSampleData,
   setManualOffline,
+  mergeRemoteSales,
 } from './utils/storage'
 import type { SaleRecord, DailySummary, VendorSettings } from './types'
 
@@ -28,6 +31,9 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0)
   const [syncing, setSyncing] = useState(false)
   const [appReady, setAppReady] = useState(false)
+  const [deferredPrompt, setDeferredPrompt] = useState<Event | null>(null)
+  const [pwaInstallable, setPwaInstallable] = useState(false)
+  const syncLockRef = useRef(false)
 
   // Seed sample data on first load
   useEffect(() => {
@@ -40,19 +46,15 @@ function App() {
   useEffect(() => {
     const unsub = onNetworkChange((online) => {
       setOnline(online)
-      if (online) {
-        handleSyncNow()
-      }
+      if (online && !syncLockRef.current) handleSyncNow()
     })
     const handleOnline = () => {
       setOnline(true)
       setManualOffline(false)
       setManualOfflineState(false)
-      handleSyncNow()
+      if (!syncLockRef.current) handleSyncNow()
     }
-    const handleOffline = () => {
-      setOnline(false)
-    }
+    const handleOffline = () => setOnline(false)
     window.addEventListener('online', handleOnline)
     window.addEventListener('offline', handleOffline)
     return () => {
@@ -62,34 +64,65 @@ function App() {
     }
   }, [])
 
+  // PWA install prompt
+  useEffect(() => {
+    const handler = (e: Event) => {
+      e.preventDefault()
+      setDeferredPrompt(e)
+      setPwaInstallable(true)
+    }
+    window.addEventListener('beforeinstallprompt', handler)
+    window.addEventListener('appinstalled', () => {
+      setPwaInstallable(false)
+      setDeferredPrompt(null)
+    })
+    return () => window.removeEventListener('beforeinstallprompt', handler)
+  }, [])
+
+  const handleInstallPwa = () => {
+    if (!deferredPrompt) return
+    const prompt = deferredPrompt as any
+    prompt.prompt()
+    prompt.userChoice.then(() => {
+      setDeferredPrompt(null)
+      setPwaInstallable(false)
+    })
+  }
+
   const loadData = useCallback(() => {
     setSales(getSales())
     setSummary(computeDailySummary())
     setSettings(getSettings())
   }, [])
 
-  const handleSyncNow = async () => {
+  const handleSyncNow = useCallback(async () => {
+    if (syncLockRef.current) return
+    syncLockRef.current = true
     setSyncing(true)
     try {
       await processSyncQueue((id, status) => {
         setSales((prev) =>
-          prev.map((s) => (s.id === id ? { ...s, syncStatus: status, syncedAt: status === 'synced' ? new Date().toISOString() : s.syncedAt } : s))
+          prev.map((s) =>
+            s.id === id
+              ? { ...s, syncStatus: status, syncedAt: status === 'synced' ? new Date().toISOString() : s.syncedAt }
+              : s
+          )
         )
       })
+      await mergeRemoteSales()
     } catch {
-      // silently handle — storage.ts handles retries
+      // silently handled
     } finally {
       loadData()
       setSyncing(false)
+      syncLockRef.current = false
     }
-  }
+  }, [loadData])
 
   const handleSaleRecorded = (sale: SaleRecord) => {
     setSales((prev) => [sale, ...prev])
     setRefreshKey((k) => k + 1)
-    if (online) {
-      handleSyncNow()
-    }
+    if (online) handleSyncNow()
   }
 
   const handleToggleOffline = () => {
@@ -102,13 +135,11 @@ function App() {
   const handleSaveSettings = (updated: VendorSettings) => {
     saveSettings(updated)
     setSettings(updated)
-    // Apply theme
     if (updated.theme === 'dark') {
       document.documentElement.classList.add('dark')
     } else if (updated.theme === 'light') {
       document.documentElement.classList.remove('dark')
     } else {
-      // system
       const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
       document.documentElement.classList.toggle('dark', prefersDark)
     }
@@ -129,130 +160,65 @@ function App() {
 
   return (
     <div className="min-h-screen bg-background pb-20 text-foreground">
-      {/* Top Status Bar - handled by Navigation component */}
       <Navigation
         activeTab={activeTab}
         onTabChange={setActiveTab}
         isOnline={online}
         isManualOffline={manualOffline}
+        pendingSyncCount={pendingSyncCount}
+        onSyncNow={handleSyncNow}
+        syncing={syncing}
       />
+
+      {/* PWA Install Banner */}
+      <AnimatePresence>
+        {pwaInstallable && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="fixed top-12 left-0 right-0 z-40 overflow-hidden"
+          >
+            <div className="flex items-center justify-between bg-emerald-600 px-4 py-2 text-white">
+              <div className="flex items-center gap-2">
+                <Download className="h-4 w-4" />
+                <span className="text-sm font-medium">Install NAIRIVO for offline use</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleInstallPwa}
+                  className="rounded-full bg-white px-3 py-1 text-xs font-bold text-emerald-700 transition-all hover:bg-emerald-50 active:scale-95"
+                >
+                  Install
+                </button>
+                <button
+                  onClick={() => setPwaInstallable(false)}
+                  className="rounded-full p-1 text-white/70 hover:text-white"
+                >
+                  <span className="text-lg leading-none">&times;</span>
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Main Content */}
       <main className="mx-auto max-w-lg px-4 pt-14">
         <AnimatePresence mode="wait">
           {activeTab === 'dashboard' && (
-            <motion.div
-              key="dashboard"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.2 }}
-            >
-              {/* Header */}
-              <div className="mb-6 flex items-center justify-between pt-2">
-                <div>
-                  <h1 className="text-2xl font-bold">{settings.businessName}</h1>
-                  <p className="text-sm text-muted-foreground">
-                    {summary?.date ? new Date(summary.date).toLocaleDateString('en-NG', { weekday: 'long', month: 'long', day: 'numeric' }) : ''}
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  {/* Manual offline toggle */}
-                  <button
-                    onClick={handleToggleOffline}
-                    className={`rounded-full p-2 transition-colors ${
-                      manualOffline ? 'bg-amber-100 text-amber-600 dark:bg-amber-950/30 dark:text-amber-400' : 'text-muted-foreground hover:bg-muted'
-                    }`}
-                    title={manualOffline ? 'Manual offline mode active' : 'Toggle offline mode'}
-                  >
-                    {manualOffline ? <WifiOff className="h-5 w-5" /> : <Wifi className="h-5 w-5" />}
-                  </button>
-                  {/* Sync status */}
-                  {syncing && (
-                    <div className="flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400">
-                      <LoaderCircle className="h-4 w-4 animate-spin" />
-                      Syncing
-                    </div>
-                  )}
-                  {!syncing && pendingSyncCount > 0 && (
-                    <div className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400">
-                      <WifiOff className="h-4 w-4" />
-                      {pendingSyncCount} pending
-                    </div>
-                  )}
-                  {!syncing && pendingSyncCount === 0 && online && (
-                    <div className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
-                      <CircleCheck className="h-4 w-4" />
-                      Synced
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Quick Actions */}
-              <div className="mb-6 grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => setActiveTab('new-sale')}
-                  className="flex min-h-[100px] flex-col items-center justify-center gap-2 rounded-2xl bg-gradient-to-br from-emerald-600 to-emerald-800 text-white shadow-lg transition-all hover:from-emerald-500 hover:to-emerald-700 active:scale-[0.97]"
-                >
-                  <span className="text-3xl font-bold">+</span>
-                  <span className="text-sm font-semibold">Record Sale</span>
-                </button>
-                <button
-                  onClick={() => setActiveTab('summary')}
-                  className="flex min-h-[100px] flex-col items-center justify-center gap-2 rounded-2xl border border-border bg-card shadow-sm transition-all hover:bg-muted/50 active:scale-[0.97]"
-                >
-                  <span className="text-3xl font-bold text-emerald-600 dark:text-emerald-400">
-                    {summary ? `₦${summary.totalRevenue.toLocaleString()}` : '₦0'}
-                  </span>
-                  <span className="text-xs font-medium text-muted-foreground">Today's Revenue</span>
-                </button>
-              </div>
-
-              {/* Recent Sales Preview */}
-              <div>
-                <div className="mb-3 flex items-center justify-between">
-                  <h2 className="font-semibold">Recent Sales</h2>
-                  <button
-                    onClick={() => setActiveTab('history')}
-                    className="text-xs font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"
-                  >
-                    View all
-                  </button>
-                </div>
-                {sales.length === 0 ? (
-                  <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-border py-12 text-center">
-                    <Smartphone className="h-8 w-8 text-muted-foreground/40" />
-                    <p className="text-sm text-muted-foreground">No sales yet</p>
-                    <button
-                      onClick={() => setActiveTab('new-sale')}
-                      className="rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white"
-                    >
-                      Record your first sale
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {sales.slice(0, 5).map((sale) => (
-                      <div key={sale.id} className="flex items-center justify-between rounded-xl border border-border bg-card p-3">
-                        <div>
-                          <p className="font-bold">{`₦${sale.amount.toLocaleString()}`}</p>
-                          {sale.itemLabel && (
-                            <p className="text-xs text-muted-foreground">{sale.itemLabel}</p>
-                          )}
-                        </div>
-                        <span className={`h-2 w-2 rounded-full ${
-                          sale.syncStatus === 'synced' ? 'bg-emerald-500' :
-                          sale.syncStatus === 'failed' ? 'bg-rose-500' :
-                          sale.syncStatus === 'syncing' ? 'bg-blue-500 animate-pulse' :
-                          'bg-amber-500 animate-pulse'
-                        }`} />
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </motion.div>
+            <DashboardView
+              settings={settings}
+              summary={summary}
+              sales={sales}
+              online={online}
+              manualOffline={manualOffline}
+              syncing={syncing}
+              pendingSyncCount={pendingSyncCount}
+              onToggleOffline={handleToggleOffline}
+              onSyncNow={handleSyncNow}
+              onTabChange={setActiveTab}
+            />
           )}
 
           {activeTab === 'history' && (
@@ -308,82 +274,19 @@ function App() {
           )}
 
           {activeTab === 'settings' && (
-            <motion.div
-              key="settings"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.2 }}
-            >
-              <div className="mb-4 pt-2">
-                <h1 className="text-2xl font-bold">Settings</h1>
-              </div>
-              <div className="space-y-4">
-                {/* Business Name */}
-                <div className="rounded-xl border border-border bg-card p-4">
-                  <label className="mb-1.5 block text-sm font-medium text-muted-foreground">Business Name</label>
-                  <input
-                    type="text"
-                    value={settings.businessName}
-                    onChange={(e) => handleSaveSettings({ ...settings, businessName: e.target.value })}
-                    className="w-full rounded-lg border border-input bg-background px-3 py-2 text-foreground focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
-                    maxLength={30}
-                  />
-                </div>
-
-                {/* Theme Toggle */}
-                <div className="rounded-xl border border-border bg-card p-4">
-                  <label className="mb-2 block text-sm font-medium text-muted-foreground">Theme</label>
-                  <div className="grid grid-cols-3 gap-2">
-                    {(['light', 'dark', 'system'] as const).map((t) => (
-                      <button
-                        key={t}
-                        onClick={() => handleSaveSettings({ ...settings, theme: t })}
-                        className={`rounded-lg px-3 py-2 text-sm font-medium capitalize transition-all ${
-                          settings.theme === t
-                            ? 'bg-emerald-600 text-white'
-                            : 'bg-muted text-muted-foreground hover:bg-muted/80'
-                        }`}
-                      >
-                        {t}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Currency */}
-                <div className="rounded-xl border border-border bg-card p-4">
-                  <label className="mb-2 block text-sm font-medium text-muted-foreground">Currency Display</label>
-                  <div className="grid grid-cols-2 gap-2">
-                    {(['₦', 'NGN'] as const).map((c) => (
-                      <button
-                        key={c}
-                        onClick={() => handleSaveSettings({ ...settings, currencySymbol: c })}
-                        className={`rounded-lg px-3 py-2 text-sm font-medium transition-all ${
-                          settings.currencySymbol === c
-                            ? 'bg-emerald-600 text-white'
-                            : 'bg-muted text-muted-foreground hover:bg-muted/80'
-                        }`}
-                      >
-                        {c}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* App Info */}
-                <div className="rounded-xl border border-border bg-card p-4 text-center text-sm text-muted-foreground">
-                  <p className="font-semibold text-foreground">NAIRIVO v1.0</p>
-                  <p className="mt-1">Mobile-first POS for Nigerian vendors</p>
-                  <p className="mt-1">Offline-first • Auto-sync</p>
-                </div>
-              </div>
-            </motion.div>
+            <SettingsView
+              settings={settings}
+              online={online}
+              syncing={syncing}
+              pendingSyncCount={pendingSyncCount}
+              salesCount={sales.length}
+              onSaveSettings={handleSaveSettings}
+              onSyncNow={handleSyncNow}
+            />
           )}
         </AnimatePresence>
       </main>
 
-      {/* New Sale Modal */}
       <NewSaleModal
         open={showNewSale}
         onClose={() => setShowNewSale(false)}
